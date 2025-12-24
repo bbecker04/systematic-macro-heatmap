@@ -1,0 +1,10 @@
+1) Open Miniforge Prompt
+
+2) Activate env:
+   conda activate fxheatmap
+
+3) Go to project:
+   cd %USERPROFILE%\Downloads\fx-heatmap
+
+4) Run app:
+   streamlit run FX_Heatmap.py
