@@ -249,9 +249,16 @@ def _fetch_fx_series_yahoo(ccy: str, start: str, end: str) -> pd.Series:
                 return pd.Series(dtype=float)
 
             col = "Adj Close" if "Adj Close" in df.columns else "Close"
-            s = df[col].dropna()
+
+            s = df[col]
+            # If df[col] comes back as a 1-column DataFrame, convert to Series
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+
+            s = s.dropna()
             if s.empty:
                 return pd.Series(dtype=float)
+
 
             # Ensure datetime index
             s.index = pd.to_datetime(s.index)
@@ -274,7 +281,7 @@ def _fetch_fx_series_yahoo(ccy: str, start: str, end: str) -> pd.Series:
 
     # ---------- 2) Fallback: Stooq CSV ----------
     # Stooq symbols are like: eurusd, gbpusd, usdjpy, etc.
-    
+
     def _stooq_get(symbol: str) -> pd.Series:
         try:
             url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
@@ -340,23 +347,36 @@ def _fetch_fx_series_yahoo(ccy: str, start: str, end: str) -> pd.Series:
     )
     return out
 
+def _to_1d_series(x, name: str) -> pd.Series:
+    """Ensure x is a 1D pandas Series (not a 1-col DataFrame)."""
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] != 1:
+            raise ValueError(f"{name}: expected 1 column, got {x.shape[1]}")
+        x = x.iloc[:, 0]
+    if not isinstance(x, pd.Series):
+        x = pd.Series(x)
+    x = x.dropna()
+    x.name = name
+    return x
+
 def run_pair_backtest(long_ccy: str, short_ccy: str, start: str, end: str) -> pd.DataFrame:
     """
     Daily long/short backtest:
-      port_ret = ret(long_ccy_vs_USD) - ret(short_ccy_vs_USD)
-      equity = cumulative product of (1 + port_ret)
+      port_ret = ret(Long_vs_USD) - ret(Short_vs_USD)
+      equity = cumprod(1 + port_ret)
 
-    We force columns to ['Long', 'Short'] so we never KeyError on 'GBP' etc.
+    Robust to data arriving as Series OR single-column DataFrame.
     """
     long_ccy = (long_ccy or "").upper().strip()
     short_ccy = (short_ccy or "").upper().strip()
 
-    long_px = _fetch_fx_series_yahoo(long_ccy, start, end)
-    short_px = _fetch_fx_series_yahoo(short_ccy, start, end)
+    long_px_raw = _fetch_fx_series_yahoo(long_ccy, start, end)
+    short_px_raw = _fetch_fx_series_yahoo(short_ccy, start, end)
 
-    # Force stable column names (prevents KeyError like "'GBP'")
-    df = pd.concat({"Long": long_px, "Short": short_px}, axis=1).dropna()
+    long_px = _to_1d_series(long_px_raw, "Long")
+    short_px = _to_1d_series(short_px_raw, "Short")
 
+    df = pd.concat([long_px, short_px], axis=1).dropna()
     if df.empty or df.shape[0] < 5:
         raise ValueError("Not enough overlapping FX data for this pair/date range.")
 
