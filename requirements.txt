@@ -1,3 +1,4 @@
+
 streamlit>=1.36
 pandas>=2.1
 numpy>=1.26
@@ -10,4 +11,7 @@ folium>=0.16
 branca>=0.7
 streamlit-folium>=0.20
 yfinance>=0.2.40
+altair
+pandas
+streamlit
 
