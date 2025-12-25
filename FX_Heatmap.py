@@ -24,6 +24,11 @@ import branca.colormap as cm
 from streamlit_folium import st_folium
 from shapely.geometry import Point
 
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent
+DATA_DIR = ROOT_DIR / "data"
+
 
 # ============================================================
 # Page config + CSS
@@ -171,7 +176,7 @@ Watch-list: next inflation prints, central bank stance/real yields, and any risk
 # ============================================================
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_PATH = Path("data/world_fx_exchange_infl_growth_policy_risk.geojson")
+DATA_PATH = APP_DIR / "data" / "world_fx_exchange_infl_growth_policy_risk.geojson"
 LAYER = None  # GeoJSON has no layers
 
 MAP_HEIGHT = 780
@@ -209,6 +214,23 @@ if "fx_base" not in st.session_state:
 if "fx_lookback" not in st.session_state:
     st.session_state["fx_lookback"] = 30
 
+if "live_fx_ready" not in st.session_state:
+    # Live FX will NOT fetch until the user clicks "Update live FX now"
+    st.session_state["live_fx_ready"] = False
+
+
+def mark_fx_dirty():
+    # Any change to FX settings should require a new manual update click
+    st.session_state["live_fx_ready"] = False
+
+# Live FX: require a manual click before fetching (prevents rerun spam)
+if "live_fx_ready" not in st.session_state:
+    st.session_state["live_fx_ready"] = False
+
+
+def mark_fx_dirty():
+    # Any change to FX settings should require another manual update click
+    st.session_state["live_fx_ready"] = False
 
 # ============================================================
 # Pair backtest helpers (Yahoo Finance via yfinance)
@@ -359,6 +381,8 @@ def _to_1d_series(x, name: str) -> pd.Series:
     x.name = name
     return x
 
+
+@st.cache_data(ttl=6 * 60 * 60, max_entries=50, show_spinner=False)
 def run_pair_backtest(long_ccy: str, short_ccy: str, start: str, end: str) -> pd.DataFrame:
     """
     Daily long/short backtest:
@@ -457,7 +481,7 @@ def load_world_fx(_data_mtime: float | None) -> gpd.GeoDataFrame:
     return gdf
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=15 * 60, max_entries=10, show_spinner=False)
 def fetch_fx_momentum_live(base: str, lookback_days: int):
     """
     Uses src/fx_momentum_exchange.py (free daily FX snapshot API).
@@ -1039,9 +1063,15 @@ except Exception as e:
 use_live_fx = bool(st.session_state["use_live_fx"])
 fx_base = str(st.session_state["fx_base"])
 fx_lookback = int(st.session_state["fx_lookback"])
+live_fx_ready = bool(st.session_state.get("live_fx_ready", False))
 
-# Live FX overlay BEFORE aggregate scoring
-gdf, fx_meta = overlay_live_fx(base_gdf, use_live=use_live_fx, base=fx_base, lookback_days=fx_lookback)
+# Live FX overlay BEFORE aggregate scoring (only after manual update)
+gdf, fx_meta = overlay_live_fx(
+    base_gdf,
+    use_live=(use_live_fx and live_fx_ready),
+    base=fx_base,
+    lookback_days=fx_lookback,
+)
 
 # Aggregate scoring (now actually uses the checkbox)
 gdf = compute_aggregate_scores(gdf, weights=weights, fill_missing_with_neutral=fill_missing)
@@ -1121,6 +1151,13 @@ selected_name = st.selectbox(
     options,
     key="selected_country",
 )
+# If a map click selected a country in the previous run, apply it BEFORE the widget is created
+if "pending_selected_country" in st.session_state:
+    pending = st.session_state["pending_selected_country"]
+    if pending in options:
+        st.session_state["selected_country"] = pending
+    del st.session_state["pending_selected_country"]
+
 
 
 selected_row = None
@@ -1148,8 +1185,10 @@ elif map_state and map_state.get("last_clicked"):
 
         if not hit.empty:
             selected_row = hit.iloc[0]
-            # Sync dropdown selection with map clicks
-            st.session_state["selected_country"] = selected_row.get("display_name", "(none)")
+# Store selection and rerun so it gets applied BEFORE the selectbox is created
+            st.session_state["pending_selected_country"] = selected_row.get("display_name", "(none)")
+            st.rerun()
+
 
 
 if selected_row is None:
@@ -1187,57 +1226,147 @@ st.divider()
 st.subheader("FX Momentum")
 
 with st.expander("Live FX Momentum settings", expanded=False):
-    st.checkbox("Use live FX momentum (cached 1h)", key="use_live_fx")
-    st.selectbox("FX base currency", ["USD", "EUR"], key="fx_base", index=0)
-    st.slider("FX lookback (days)", min_value=5, max_value=252, value=30, key="fx_lookback")
+    st.checkbox("Use live FX momentum (manual update)", key="use_live_fx", on_change=mark_fx_dirty)
+    st.selectbox("FX base currency", ["USD", "EUR"], key="fx_base", index=0, on_change=mark_fx_dirty)
+    st.slider(
+        "FX lookback (days)",
+        min_value=5,
+        max_value=252,
+        value=30,
+        key="fx_lookback",
+        on_change=mark_fx_dirty,
+    )
+
+    # Guidance for the user
+    if st.session_state.get("use_live_fx", False) and not st.session_state.get("live_fx_ready", False):
+        st.info("Live FX is ON but not loaded yet. Click **Update live FX now** to fetch it.")
+
+    # Allow fetching on the next rerun
+    if st.button("Update live FX now"):
+        st.session_state["live_fx_ready"] = True
+        st.rerun()
+
+    # Optional: force a true refresh (ignore any cached data)
+    if st.button("Force refresh (clear cache)"):
+        st.cache_data.clear()
+        st.session_state["live_fx_ready"] = True
+        st.rerun()
 
     if fx_meta and isinstance(fx_meta, dict) and fx_meta.get("error"):
         st.warning(f"Live FX error: {fx_meta['error']}")
 
-    if st.button("Refresh FX data now"):
-        st.cache_data.clear()
-        st.rerun()
-
-
 # ============================================================
 # Pair Backtest (Long/Short)
 # ============================================================
+import datetime as dt
+
+# Build a Country -> Currency mapping for the backtest selectors
+# (Uses the latest gdf which already has display_name + currency columns)
+country_to_ccy = {}
+
+# Your dataset uses primary_currency (fallback to currency if present)
+ccy_col = None
+if "primary_currency" in gdf.columns:
+    ccy_col = "primary_currency"
+elif "currency" in gdf.columns:
+    ccy_col = "currency"
+
+if "display_name" in gdf.columns and ccy_col is not None:
+    tmp = gdf[["display_name", ccy_col]].dropna()
+    country_to_ccy = dict(
+        zip(tmp["display_name"].astype(str), tmp[ccy_col].astype(str))
+    )
+
+bt_country_options = sorted(country_to_ccy.keys())
+
 
 st.subheader("Pair Backtest (Long/Short)")
 
-available_ccys = sorted(pd.Series(gdf["primary_currency"]).dropna().unique().tolist())
-available_ccys = [c for c in available_ccys if isinstance(c, str) and len(c) == 3]
+if not bt_country_options:
+    st.warning("Backtest unavailable: missing display_name/currency mapping in the dataset.")
+else:
+    today = dt.date.today()
+    default_start = today - dt.timedelta(days=365)
 
-c1, c2 = st.columns(2)
-with c1:
-    long_ccy = st.selectbox("Long", ["(select)"] + available_ccys, index=0)
-with c2:
-    short_ccy = st.selectbox("Short", ["(select)"] + available_ccys, index=0)
+    with st.form("backtest_form"):
+        c1, c2 = st.columns(2)
 
-c3, c4 = st.columns(2)
-with c3:
-    start_date = st.date_input("Start date", value=pd.to_datetime("2015-01-01").date())
-with c4:
-    end_date = st.date_input("End date", value=pd.Timestamp.today().date())
+        with c1:
+            long_country = st.selectbox(
+                "Long country",
+                bt_country_options,
+                key="bt_long_country",
+            )
+        with c2:
+            short_country = st.selectbox(
+                "Short country",
+                bt_country_options,
+                key="bt_short_country",
+            )
 
-if long_ccy != "(select)" and short_ccy != "(select)":
-    if long_ccy == short_ccy:
-        st.warning("Long and Short can’t be the same currency.")
+        d1, d2 = st.columns(2)
+        with d1:
+            start_date = st.date_input(
+                "Start date",
+                value=default_start,
+                key="bt_start_date",
+            )
+        with d2:
+            end_date = st.date_input(
+                "End date",
+                value=today,
+                key="bt_end_date",
+            )
+
+        run_bt = st.form_submit_button("Run backtest")
+
+    if not run_bt:
+        st.info("Choose countries + dates, then click **Run backtest**.")
     else:
-        with st.spinner(f"Running backtest: Long {long_ccy} / Short {short_ccy} ..."):
-            try:
-                bt = run_pair_backtest(long_ccy=long_ccy, short_ccy=short_ccy, start=str(start_date), end=str(end_date))
-                stats = summarize_backtest(bt)
+        # Basic validation
+        if long_country == short_country:
+            st.warning("Pick two different countries.")
+        elif start_date >= end_date:
+            st.warning("Start date must be before end date.")
+        else:
+            # Convert selected countries -> currency codes
+            long_ccy = country_to_ccy.get(long_country)
+            short_ccy = country_to_ccy.get(short_country)
 
-                st.line_chart(bt["equity"])
+            if not long_ccy or not short_ccy:
+                st.error("Could not map one of the selected countries to a currency code.")
+            else:
+                st.caption(
+                    f"Mapped: {long_country} → {long_ccy} | {short_country} → {short_ccy}"
+                )
 
-                if stats:
-                    stats_df = pd.DataFrame({"Metric": list(stats.keys()), "Value": list(stats.values())})
-                    st.dataframe(stats_df, use_container_width=True)
+                with st.spinner(
+                    f"Running backtest: Long {long_country} ({long_ccy}) / Short {short_country} ({short_ccy}) ..."
+                ):
+                    try:
+                        bt = run_pair_backtest(
+                            long_ccy=long_ccy,
+                            short_ccy=short_ccy,
+                            start=str(start_date),
+                            end=str(end_date),
+                        )
 
-                with st.expander("Show daily returns table"):
-                    st.dataframe(bt[["long_ret", "short_ret", "port_ret", "equity"]].tail(50), use_container_width=True)
+                        stats = summarize_backtest(bt)
 
-            except Exception as e:
-                st.error(str(e))
-                st.info("If the error mentions yfinance, install it with: pip install yfinance")
+                        st.line_chart(bt["equity"])
+
+                        if stats:
+                            stats_df = pd.DataFrame(
+                                {"Metric": list(stats.keys()), "Value": list(stats.values())}
+                            )
+                            st.dataframe(stats_df, use_container_width=True)
+
+                        with st.expander("Show daily returns table"):
+                            cols = [c for c in ["long_ret", "short_ret", "port_ret", "equity"] if c in bt.columns]
+                            st.dataframe(bt[cols].tail(50), use_container_width=True)
+
+                    except Exception as e:
+                        st.error(str(e))
+                        st.info(
+                            "If the error mentions yfinance, install it with: pip install yfinance"
+                        )
